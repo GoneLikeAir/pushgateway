@@ -16,12 +16,6 @@ package handler
 import (
 	"encoding/base64"
 	"fmt"
-	"io"
-	"mime"
-	"net/http"
-	"strings"
-	"time"
-
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/matttproud/golang_protobuf_extensions/pbutil"
@@ -29,6 +23,13 @@ import (
 	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
+	promlabels "github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
+	"io"
+	"mime"
+	"net/http"
+	"strings"
+	"time"
 
 	dto "github.com/prometheus/client_model/go"
 
@@ -52,6 +53,7 @@ const (
 func Push(
 	ms storage.MetricStore,
 	replace, check, jobBase64Encoded bool,
+	getRelabelConfigFunc func() []*relabel.Config,
 	logger log.Logger,
 ) func(http.ResponseWriter, *http.Request) {
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -106,6 +108,26 @@ func Push(
 			level.Debug(logger).Log("msg", "failed to parse text", "source", r.RemoteAddr, "err", err.Error())
 			return
 		}
+		// todo: need to drop metrics here
+		//b, _ := json.Marshal(metricFamilies)
+		//level.Info(logger).Log("msg", string(b))
+		if getRelabelConfigFunc() != nil {
+			for _, mf := range metricFamilies {
+				finalMetric := make([]*dto.Metric, 0)
+				for _, m := range mf.Metric {
+					lbs := parseLabel(m.Label, logger)
+					lbs = append(lbs, promlabels.Label{
+						Name:  "__name__",
+						Value: *mf.Name,
+					})
+					if _, keep := relabel.Process(lbs, getRelabelConfigFunc()...); keep {
+						//level.Info(logger).Log("msg", "keep")
+						finalMetric = append(finalMetric, m)
+					}
+				}
+				mf.Metric = finalMetric
+			}
+		}
 		now := time.Now()
 		if !check {
 			ms.SubmitWriteRequest(storage.WriteRequest{
@@ -156,6 +178,18 @@ func Push(
 	return func(w http.ResponseWriter, r *http.Request) {
 		instrumentedHandler.ServeHTTP(w, r)
 	}
+}
+
+func parseLabel(lbs []*dto.LabelPair, logger log.Logger) promlabels.Labels {
+	parsed := make(promlabels.Labels, 0, len(lbs))
+	for _, l := range lbs {
+		level.Info(logger).Log("key", *l.Name, "val", *l.Value)
+		parsed = append(parsed, promlabels.Label{
+			Name:  *l.Name,
+			Value: *l.Value,
+		})
+	}
+	return parsed
 }
 
 // decodeBase64 decodes the provided string using the “Base 64 Encoding with URL

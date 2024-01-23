@@ -26,7 +26,9 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
@@ -39,6 +41,12 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
+	"github.com/prometheus/prometheus/config"
+	_ "github.com/prometheus/prometheus/discovery/file"
+	_ "github.com/prometheus/prometheus/discovery/http"
+	_ "github.com/prometheus/prometheus/discovery/kubernetes"
+	"github.com/prometheus/prometheus/model/relabel"
+	"io/ioutil"
 
 	dto "github.com/prometheus/client_model/go"
 	promlogflag "github.com/prometheus/common/promlog/flag"
@@ -62,17 +70,20 @@ func (lf logFunc) Println(v ...interface{}) {
 
 func main() {
 	var (
-		app                 = kingpin.New(filepath.Base(os.Args[0]), "The Pushgateway")
-		webConfig           = webflag.AddFlags(app, ":9091")
-		metricsPath         = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
-		externalURL         = app.Flag("web.external-url", "The URL under which the Pushgateway is externally reachable.").Default("").URL()
-		routePrefix         = app.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to the path of --web.external-url.").Default("").String()
-		enableLifeCycle     = app.Flag("web.enable-lifecycle", "Enable shutdown via HTTP request.").Default("false").Bool()
-		enableAdminAPI      = app.Flag("web.enable-admin-api", "Enable API endpoints for admin control actions.").Default("false").Bool()
-		persistenceFile     = app.Flag("persistence.file", "File to persist metrics. If empty, metrics are only kept in memory.").Default("").String()
-		persistenceInterval = app.Flag("persistence.interval", "The minimum interval at which to write out the persistence file.").Default("5m").Duration()
-		pushUnchecked       = app.Flag("push.disable-consistency-check", "Do not check consistency of pushed metrics. DANGEROUS.").Default("false").Bool()
-		promlogConfig       = promlog.Config{}
+		app                  = kingpin.New(filepath.Base(os.Args[0]), "The Pushgateway")
+		webConfig            = webflag.AddFlags(app, ":9091")
+		metricsPath          = app.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
+		externalURL          = app.Flag("web.external-url", "The URL under which the Pushgateway is externally reachable.").Default("").URL()
+		routePrefix          = app.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to the path of --web.external-url.").Default("").String()
+		enableLifeCycle      = app.Flag("web.enable-lifecycle", "Enable shutdown via HTTP request.").Default("false").Bool()
+		enableAdminAPI       = app.Flag("web.enable-admin-api", "Enable API endpoints for admin control actions.").Default("false").Bool()
+		persistenceFile      = app.Flag("persistence.file", "File to persist metrics. If empty, metrics are only kept in memory.").Default("").String()
+		persistenceInterval  = app.Flag("persistence.interval", "The minimum interval at which to write out the persistence file.").Default("5m").Duration()
+		pushUnchecked        = app.Flag("push.disable-consistency-check", "Do not check consistency of pushed metrics. DANGEROUS.").Default("false").Bool()
+		timeToLive           = app.Flag("metric.timetolive", "The time to Live interval for metrics").Default("0s").Duration()
+		pushPrometheusConfig = app.Flag("push.prometheus-config", "The prometheus config file, using to associate with a scrape job to reduce the metrics.").Default("").String()
+		pushAssociatedJob    = app.Flag("push.associated-job", "The scrape job that need to associate with.").Default("").String()
+		promlogConfig        = promlog.Config{}
 	)
 	promlogflag.AddFlags(app, &promlogConfig)
 	app.Version(version.Print("pushgateway"))
@@ -98,8 +109,26 @@ func main() {
 			flags[f.Name] = f.Value.String()
 		}
 	}
+	level.Info(logger).Log("prometheusConfig", *pushPrometheusConfig, "job", *pushAssociatedJob)
+	rs := NewRelabelConfigSyncer(*pushPrometheusConfig, *pushAssociatedJob, logger)
+	go rs.Sync()
+	level.Info(logger).Log("msg", "aaaaa")
+	//var relabelConfig []*relabel.Config
+	//if *pushPrometheusConfig != "" && *pushAssociatedJob != "" {
+	//	promCfg, err := readPromConfig(*pushPrometheusConfig, logger)
+	//	if err != nil {
+	//		level.Info(logger).Log("msg", "read prometheus config failed, abort loading promConfig")
+	//	}
+	//	if promCfg != nil {
+	//		for _, job := range promCfg.ScrapeConfigs {
+	//			if job.JobName == *pushAssociatedJob {
+	//				relabelConfig = job.MetricRelabelConfigs
+	//			}
+	//		}
+	//	}
+	//}
 
-	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, logger)
+	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, logger, *timeToLive)
 
 	// Create a Gatherer combining the DefaultGatherer and the metrics from the metric store.
 	g := prometheus.Gatherers{
@@ -121,11 +150,11 @@ func main() {
 	pushAPIPath := *routePrefix + "/metrics"
 	for _, suffix := range []string{"", handler.Base64Suffix} {
 		jobBase64Encoded := suffix == handler.Base64Suffix
-		r.Put(pushAPIPath+"/job"+suffix+"/:job/*labels", handler.Push(ms, true, !*pushUnchecked, jobBase64Encoded, logger))
-		r.Post(pushAPIPath+"/job"+suffix+"/:job/*labels", handler.Push(ms, false, !*pushUnchecked, jobBase64Encoded, logger))
+		r.Put(pushAPIPath+"/job"+suffix+"/:job/*labels", handler.Push(ms, true, !*pushUnchecked, jobBase64Encoded, rs.GetRelabelConfig, logger))
+		r.Post(pushAPIPath+"/job"+suffix+"/:job/*labels", handler.Push(ms, false, !*pushUnchecked, jobBase64Encoded, rs.GetRelabelConfig, logger))
 		r.Del(pushAPIPath+"/job"+suffix+"/:job/*labels", handler.Delete(ms, jobBase64Encoded, logger))
-		r.Put(pushAPIPath+"/job"+suffix+"/:job", handler.Push(ms, true, !*pushUnchecked, jobBase64Encoded, logger))
-		r.Post(pushAPIPath+"/job"+suffix+"/:job", handler.Push(ms, false, !*pushUnchecked, jobBase64Encoded, logger))
+		r.Put(pushAPIPath+"/job"+suffix+"/:job", handler.Push(ms, true, !*pushUnchecked, jobBase64Encoded, rs.GetRelabelConfig, logger))
+		r.Post(pushAPIPath+"/job"+suffix+"/:job", handler.Push(ms, false, !*pushUnchecked, jobBase64Encoded, rs.GetRelabelConfig, logger))
 		r.Del(pushAPIPath+"/job"+suffix+"/:job", handler.Delete(ms, jobBase64Encoded, logger))
 	}
 	r.Get(*routePrefix+"/static/*filepath", handler.Static(asset.Assets, *routePrefix).ServeHTTP)
@@ -135,7 +164,7 @@ func main() {
 	r.Get(*routePrefix+"/", statusHandler.ServeHTTP)
 
 	// Re-enable pprof.
-	r.Get(*routePrefix+"/debug/pprof/*pprof", handlePprof)
+	//r.Get(*routePrefix+"/debug/pprof/*pprof", handlePprof)
 
 	quitCh := make(chan struct{})
 	quitHandler := func(w http.ResponseWriter, r *http.Request) {
@@ -203,6 +232,34 @@ func main() {
 	if err := ms.Shutdown(); err != nil {
 		level.Error(logger).Log("msg", "problem shutting down metric storage", "err", err)
 	}
+}
+
+func readPromConfig(promConfPath string, logger log.Logger) (*config.Config, error) {
+
+	fi, err := os.Stat(promConfPath)
+	if err != nil {
+		return nil, err
+	}
+	if fi.IsDir() {
+		return nil, fmt.Errorf("that is a dir, not a prometheus config file")
+	}
+	file, err := os.OpenFile(promConfPath, os.O_RDONLY, fi.Mode())
+	if err != nil {
+		level.Warn(logger).Log("msg", "open prometheus config failed", "err", err.Error())
+		return nil, err
+	}
+
+	b, err := ioutil.ReadAll(file)
+	if err != nil {
+		level.Warn(logger).Log("msg", "read prometheus config failed", "err", err.Error())
+		return nil, err
+	}
+	promCfg, err := config.Load(string(b), false, logger)
+	if err != nil {
+		level.Warn(logger).Log("msg", "load prometheus config failed", "err", err.Error())
+		return nil, err
+	}
+	return promCfg, nil
 }
 
 func decodeRequest(h http.Handler) http.Handler {
@@ -276,4 +333,61 @@ func shutdownServerOnQuit(server *http.Server, quitCh <-chan struct{}, logger lo
 		break
 	}
 	return server.Shutdown(context.Background())
+}
+
+type RelabelConfigSyncer struct {
+	mu             sync.Mutex
+	relabelConfig  []*relabel.Config
+	promConfigPath string
+	job            string
+	logger         log.Logger
+}
+
+func NewRelabelConfigSyncer(promConfigPath, job string, logger log.Logger) *RelabelConfigSyncer {
+	return &RelabelConfigSyncer{
+		mu:             sync.Mutex{},
+		relabelConfig:  nil,
+		promConfigPath: promConfigPath,
+		job:            job,
+		logger:         logger,
+	}
+}
+
+func (s *RelabelConfigSyncer) Sync() {
+	tick := time.NewTicker(time.Second * 30)
+	s.syncOnce()
+	for {
+		select {
+		case <-tick.C:
+			s.syncOnce()
+		}
+	}
+}
+
+func (s *RelabelConfigSyncer) GetRelabelConfig() []*relabel.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.relabelConfig
+}
+
+func (s *RelabelConfigSyncer) syncOnce() {
+	level.Debug(s.logger).Log("msg", "start reading config")
+	defer level.Debug(s.logger).Log("msg", "sync relabel config done")
+	if s.promConfigPath != "" && s.job != "" {
+		promCfg, err := readPromConfig(s.promConfigPath, s.logger)
+		if err != nil {
+			level.Info(s.logger).Log("msg", "read prometheus config failed, abort loading promConfig")
+		}
+		if promCfg != nil {
+			for _, job := range promCfg.ScrapeConfigs {
+				if job.JobName == s.job {
+					s.mu.Lock()
+					defer s.mu.Unlock()
+					s.relabelConfig = job.MetricRelabelConfigs
+					return
+				}
+			}
+		}
+	}
+
 }
